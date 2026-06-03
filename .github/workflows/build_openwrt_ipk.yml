@@ -1,0 +1,88 @@
+name: Build OpenWrt IPK (Slate 7 Pro)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build_openwrt:
+    runs-on: ubuntu-20.04  # Utilizing Ubuntu 20.04 to prevent host toolchain version skew conflicts with older SDKs
+
+    steps:
+    - name: Checkout local source
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    - name: Install build prerequisites
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y build-essential libncurses5-dev gawk git subversion libssl-dev gettext unzip zlib1g-dev file python3-distutils rsync wget
+
+    - name: Download and extract OpenWrt SDK
+      run: |
+        # Download the OpenWrt 21.02 SDK for the target producing aarch64_cortex-a53 packages
+        wget https://downloads.openwrt.org/releases/21.02.7/targets/mediatek/mt7622/openwrt-sdk-21.02.7-mediatek-mt7622_gcc-8.4.0_musl.Linux-x86_64.tar.xz
+        tar -xf openwrt-sdk-*.tar.xz
+        mv openwrt-sdk-* sdk
+
+    - name: Update and install feeds
+      run: |
+        cd sdk
+        ./scripts/feeds update -a
+        ./scripts/feeds install -a
+
+    - name: Configure Domoticz Package Makefile
+      shell: python
+      run: |
+        import os
+        import re
+
+        # Ensure target directory exists in SDK
+        os.makedirs('sdk/package/domoticz', exist_ok=True)
+
+        # Download the official Domoticz package recipe Makefile from upstream OpenWrt
+        os.system('wget https://raw.githubusercontent.com/openwrt/packages/master/utils/domoticz/Makefile -O sdk/package/domoticz/Makefile')
+
+        # Read the downloaded Makefile
+        with open('sdk/package/domoticz/Makefile', 'r') as f:
+            content = f.read()
+
+        # 1. Clear original download URLs and hashes so it builds from our workspace instead
+        content = re.sub(r'PKG_SOURCE:=.*?\n', 'PKG_SOURCE:=\n', content)
+        content = re.sub(r'PKG_SOURCE_URL:=.*?\n', 'PKG_SOURCE_URL:=\n', content)
+        content = re.sub(r'PKG_HASH:=.*?\n', 'PKG_HASH:=\n', content)
+
+        # 2. Mark this custom latest version
+        content = re.sub(r'PKG_VERSION:=.*?\n', 'PKG_VERSION:=custom-latest\n', content)
+        content = re.sub(r'PKG_RELEASE:=.*?\n', 'PKG_RELEASE:=1\n', content)
+
+        # 3. Strip any existing Build/Prepare directives and write a custom copy task
+        local_workspace = os.environ['GITHUB_WORKSPACE']
+        prepare_block = f"""define Build/Prepare
+        \tmkdir -p $(PKG_BUILD_DIR)
+        \t$(CP) {local_workspace}/* $(PKG_BUILD_DIR)/
+        endef"""
+        
+        # Replace existing block if it exists, or insert it right before BuildPackage call
+        if 'define Build/Prepare' in content:
+            content = re.sub(r'define Build/Prepare.*?endef', prepare_block, content, flags=re.DOTALL)
+        else:
+            content = content.replace('$(eval $(call BuildPackage,domoticz))', f'{prepare_block}\n\n$(eval $(call BuildPackage,domoticz))')
+
+        # Save the patched Makefile
+        with open('sdk/package/domoticz/Makefile', 'w') as f:
+            f.write(content)
+
+    - name: Build Domoticz IPK
+      run: |
+        cd sdk
+        # Generate default system configs
+        make defconfig
+        # Compile the package and its feed-provided dependencies (boost, sqlite, etc.)
+        make package/domoticz/compile -j$(nproc) V=s
+
+    - name: Upload IPK Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: domoticz-openwrt-21.02-ipk
+        path: sdk/bin/packages/aarch64_cortex-a53/**/*.ipk
